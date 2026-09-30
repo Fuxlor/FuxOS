@@ -301,6 +301,62 @@ static void pit_init(uint32_t freq_hz)
 }
 
 /* ==================================================
+   Clavier
+   ================================================== */
+
+#define KBD_DATA 0x60
+
+static volatile int shift_pressed = 0;
+
+/* Scancode Set 1, disposition US (indices 0x00 à 0x39 utiles) */
+static const char scancode_ascii[] = {
+    0,    0,   '1', '2', '3', '4', '5', '6', '7', '8',   /* 0x00-0x09 */
+    '9',  '0', '-', '=', '\b','\t','q', 'w', 'e', 'r',   /* 0x0A-0x13 */
+    't',  'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0,     /* 0x14-0x1D (0x1D = Ctrl) */
+    'a',  's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';',    /* 0x1E-0x27 */
+    '\'', '`', 0,   '\\','z', 'x', 'c', 'v', 'b', 'n',    /* 0x28-0x31 (0x2A = Shift) */
+    'm',  ',', '.', '/', 0,   '*', 0,   ' '               /* 0x32-0x39 */
+};
+
+static const char scancode_ascii_shift[] = {
+    0,    0,   '!', '@', '#', '$', '%', '^', '&', '*',
+    '(',  ')', '_', '+', '\b','\t','Q', 'W', 'E', 'R',
+    'T',  'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0,
+    'A',  'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':',
+    '"',  '~', 0,   '|', 'Z', 'X', 'C', 'V', 'B', 'N',
+    'M',  '<', '>', '?', 0,   '*', 0,   ' '
+};
+
+#define SC_LSHIFT      0x2A
+#define SC_RSHIFT      0x36
+#define SC_LSHIFT_UP   0xAA
+#define SC_RSHIFT_UP   0xB6
+
+static void keyboard_handler(void)
+{
+    uint8_t sc = inb(KBD_DATA);
+
+    if (sc == SC_LSHIFT || sc == SC_RSHIFT) {
+        shift_pressed = 1;
+        return;
+    }
+    if (sc == SC_LSHIFT_UP || sc == SC_RSHIFT_UP) {
+        shift_pressed = 0;
+        return;
+    }
+
+    if (sc & 0x80)                          /* relâchement d'une autre touche : ignoré */
+        return;
+
+    if (sc >= sizeof(scancode_ascii))       /* touche hors de notre table */
+        return;
+
+    char c = shift_pressed ? scancode_ascii_shift[sc] : scancode_ascii[sc];
+    if (c != 0)
+        putc(c);
+}
+
+/* ==================================================
    Handlers interruptions
    ================================================== */
 
@@ -308,6 +364,8 @@ static void irq_handler(int vector)
 {
     if (vector == 32)          /* IRQ0 = timer */
         timer_ticks++;
+    else if (vector == 33)         /* IRQ1 = clavier */
+        keyboard_handler();
 
     if (vector >= 40)
         outb(PIC2_CMD, 0x20);
@@ -376,12 +434,9 @@ void kmain(void)
     __asm__ volatile ("sti");
     kprintf("Interruptions activees\n");
 
-    uint64_t last_shown = 0;
+    kprintf("Tape au clavier : ");
+
     while (1) {
-        if (timer_ticks != last_shown && timer_ticks % 100 == 0) {
-            kprintf("Secondes ecoulees : %d\n", (int64_t)(timer_ticks / 100));
-            last_shown = timer_ticks;
-        }
         __asm__ volatile ("hlt");
     }
 }
