@@ -238,6 +238,74 @@ ISR_NOERR(20)  ISR_NOERR(21)  ISR_NOERR(22)  ISR_NOERR(23)
 ISR_NOERR(24)  ISR_NOERR(25)  ISR_NOERR(26)  ISR_NOERR(27)
 ISR_NOERR(28)  ISR_NOERR(29)  ISR_ERR(30)    ISR_NOERR(31)
 
+// ACCES PORTS I/O
+static inline void outb(uint16_t port, uint8_t val)
+{
+    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port)
+{
+    uint8_t ret;
+    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/* ==================================================
+   PIC
+   ================================================== */
+
+#define PIC1_CMD  0x20
+#define PIC1_DATA 0x21
+#define PIC2_CMD  0xA0
+#define PIC2_DATA 0xA1
+
+static void pic_remap(void)
+{
+    uint8_t mask1 = inb(PIC1_DATA);
+    uint8_t mask2 = inb(PIC2_DATA);
+
+    outb(PIC1_CMD, 0x11);   /* ICW1 : démarre la séquence d'init */
+    outb(PIC2_CMD, 0x11);
+
+    outb(PIC1_DATA, 0x20);  /* ICW2 : IRQ 0-7  -> vecteurs 32-39 */
+    outb(PIC2_DATA, 0x28);  /* ICW2 : IRQ 8-15 -> vecteurs 40-47 */
+
+    outb(PIC1_DATA, 0x04);  /* ICW3 : dit au maître qu'un esclave est sur IRQ2 */
+    outb(PIC2_DATA, 0x02);  /* ICW3 : dit à l'esclave son numéro d'IRQ (2) */
+
+    outb(PIC1_DATA, 0x01);  /* ICW4 : mode 8086 */
+    outb(PIC2_DATA, 0x01);
+
+    outb(PIC1_DATA, mask1); /* restaure les masques d'origine */
+    outb(PIC2_DATA, mask2);
+}
+
+/* ==================================================
+   Handlers interruptions
+   ================================================== */
+
+static void irq_handler(int vector)
+{
+    /* EOI : dire au PIC que l'interruption est traitée */
+    if (vector >= 40)
+        outb(PIC2_CMD, 0x20);   /* seulement si ça vient de l'esclave */
+    outb(PIC1_CMD, 0x20);       /* toujours, dans les deux cas */
+}
+
+#define IRQ_HANDLER(n)                                                \
+    __attribute__((interrupt))                                        \
+    static void irq##n(struct interrupt_frame *frame)                 \
+    {                                                                  \
+        (void)frame;                                                   \
+        irq_handler(32 + n);                                           \
+    }
+
+IRQ_HANDLER(0)  IRQ_HANDLER(1)  IRQ_HANDLER(2)  IRQ_HANDLER(3)
+IRQ_HANDLER(4)  IRQ_HANDLER(5)  IRQ_HANDLER(6)  IRQ_HANDLER(7)
+IRQ_HANDLER(8)  IRQ_HANDLER(9)  IRQ_HANDLER(10) IRQ_HANDLER(11)
+IRQ_HANDLER(12) IRQ_HANDLER(13) IRQ_HANDLER(14) IRQ_HANDLER(15)
+
 static void idt_init(void)
 {
     void *handlers[32] = {
@@ -249,6 +317,14 @@ static void idt_init(void)
 
     for (int i = 0; i < 32; i++)
         idt_set_entry(i, handlers[i]);
+
+    void *irq_handlers[16] = {
+        irq0,  irq1,  irq2,  irq3,  irq4,  irq5,  irq6,  irq7,
+        irq8,  irq9,  irq10, irq11, irq12, irq13, irq14, irq15
+    };
+
+    for (int i = 0; i < 16; i++)
+        idt_set_entry(32 + i, irq_handlers[i]);
 
     idt_load();
 }
@@ -276,6 +352,9 @@ void kmain(void)
     idt_init();
     kprintf("IDT chargee (%d entrees)\n", (int64_t)32);
 
+    pic_remap();
+    __asm__ volatile ("sti");
+    kprintf("Interruptions activees\n");
     /* Test : provoquer volontairement une division par zero */
     volatile int a = 10, b = 0;
     kprintf("Test : %d\n", (int64_t)(a / b));
