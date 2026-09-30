@@ -282,15 +282,36 @@ static void pic_remap(void)
 }
 
 /* ==================================================
+   PIT (Timer)
+   ================================================== */
+
+#define PIT_CHANNEL0 0x40
+#define PIT_COMMAND  0x43
+#define PIT_FREQ     1193182
+
+static volatile uint64_t timer_ticks = 0;
+
+static void pit_init(uint32_t freq_hz)
+{
+    uint16_t divisor = PIT_FREQ / freq_hz;
+
+    outb(PIT_COMMAND, 0x36);              /* canal 0, lobit puis hibit, mode 3 (carré) */
+    outb(PIT_CHANNEL0, divisor & 0xFF);        /* octet bas */
+    outb(PIT_CHANNEL0, (divisor >> 8) & 0xFF); /* octet haut */
+}
+
+/* ==================================================
    Handlers interruptions
    ================================================== */
 
 static void irq_handler(int vector)
 {
-    /* EOI : dire au PIC que l'interruption est traitée */
+    if (vector == 32)          /* IRQ0 = timer */
+        timer_ticks++;
+
     if (vector >= 40)
-        outb(PIC2_CMD, 0x20);   /* seulement si ça vient de l'esclave */
-    outb(PIC1_CMD, 0x20);       /* toujours, dans les deux cas */
+        outb(PIC2_CMD, 0x20);
+    outb(PIC1_CMD, 0x20);
 }
 
 #define IRQ_HANDLER(n)                                                \
@@ -342,8 +363,6 @@ void kmain(void)
     for (volatile char *p = __bss_start; p < __bss_end; p++)
         *p = 0;
 
-    /* 2. Initialiser la console. On garde les 3 lignes du bootloader
-          en haut de l'écran et on écrit en dessous. */
     color = 0x0F;
     cursor_row = 3;
 
@@ -353,14 +372,16 @@ void kmain(void)
     kprintf("IDT chargee (%d entrees)\n", (int64_t)32);
 
     pic_remap();
+    pit_init(100);              /* 100 ticks par seconde */
     __asm__ volatile ("sti");
     kprintf("Interruptions activees\n");
-    /* Test : provoquer volontairement une division par zero */
-    volatile int a = 10, b = 0;
-    kprintf("Test : %d\n", (int64_t)(a / b));
 
-    kprintf("Cette ligne ne devrait jamais s'afficher\n");
-
-    for (;;)
+    uint64_t last_shown = 0;
+    while (1) {
+        if (timer_ticks != last_shown && timer_ticks % 100 == 0) {
+            kprintf("Secondes ecoulees : %d\n", (int64_t)(timer_ticks / 100));
+            last_shown = timer_ticks;
+        }
         __asm__ volatile ("hlt");
+    }
 }
