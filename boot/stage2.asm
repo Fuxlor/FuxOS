@@ -10,6 +10,9 @@ KERNEL_ADDR    equ 0x10000
 KERNEL_LBA     equ 17           ; premier secteur du kernel sur le disque
 KERNEL_SECTORS equ 32           ; 16 Ko max
 
+MMAP_ADDR       equ 0x9000      ; où stocker la carte mémoire en RAM
+MMAP_COUNT     equ 0x8FFC      ; 4 octets juste avant, pour stocker le nombre d'entrées
+
 
 ; ==================================================
 ; Point d'entrée (mode réel 16-bit)
@@ -22,6 +25,7 @@ stage2_start:
     mov [boot_drive], dl        ; DL est transmis par le stage 1
     sti                         ; le BIOS a besoin des interruptions pour int 0x13
 
+    call detect_memory
     call load_kernel
 
     cli
@@ -93,6 +97,49 @@ boot_drive:         db 0
 lba:                dw 0
 disk_error_message: db "DISK ERROR!", 0
 
+; ==================================================
+; Détection mémoire (BIOS int 0x15, E820)
+; ==================================================
+
+detect_memory:
+    pusha
+
+    mov di, MMAP_ADDR       ; ES:DI = destination de l'entrée courante
+    xor ebx, ebx             ; doit être 0 au premier appel
+    xor bp, bp                ; bp = compteur d'entrées trouvées
+
+.loop:
+    mov eax, 0xE820
+    mov ecx, 24                ; taille attendue d'une entrée
+    mov edx, 0x534D4150        ; "SMAP", signature magique exigée
+    int 0x15
+
+    jc .done                    ; erreur ou fin de liste
+
+    cmp eax, 0x534D4150         ; le BIOS renvoie SMAP en retour si ok
+    jne .done
+
+    cmp ecx, 20                  ; certains BIOS renvoient 20 octets, pas 24
+    jbe .valid_entry
+    ; sinon (24 octets), rien de spécial à faire, l'entrée est déjà complète
+
+.valid_entry:
+    inc bp
+    add di, 24
+
+    cmp ebx, 0                   ; ebx = 0 -> c'était la dernière entrée
+    je .done
+
+    cmp bp, 64                    ; sécurité : pas plus de 64 entrées stockées
+    jae .done
+
+    jmp .loop
+
+.done:
+    mov [MMAP_COUNT], bp
+
+    popa
+    ret
 
 ; ==================================================
 ; GDT

@@ -357,6 +357,253 @@ static void keyboard_handler(void)
 }
 
 /* ==================================================
+   Carte mémoire (remplie par stage2.asm via int 0x15/E820)
+   ================================================== */
+
+struct mmap_entry {
+    uint64_t base;
+    uint64_t length;
+    uint32_t type;
+    uint32_t attr;
+} __attribute__((packed));
+
+#define MMAP_ADDR  0x9000
+#define MMAP_COUNT ((uint32_t*)0x8FFC)
+
+static const char *mmap_type_str(uint32_t type)
+{
+    switch (type) {
+        case 1: return "Usable";
+        case 2: return "Reserved";
+        case 3: return "ACPI reclaimable";
+        case 4: return "ACPI NVS";
+        case 5: return "Bad memory";
+        default: return "Unknown";
+    }
+}
+
+static void mmap_print(void)
+{
+    uint32_t count = *MMAP_COUNT;
+    struct mmap_entry *entries = (struct mmap_entry *)MMAP_ADDR;
+
+    kprintf("Carte memoire : %d entrees\n", (int64_t)count);
+
+    uint64_t total_usable = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        struct mmap_entry *e = &entries[i];
+
+        kprintf("  base=%x taille=%x type=%s\n",
+                e->base, e->length, mmap_type_str(e->type));
+
+        if (e->type == 1)
+            total_usable += e->length;
+    }
+
+    kprintf("RAM utilisable : %d Ko\n", (int64_t)(total_usable / 1024));
+}
+
+/* ==================================================
+   Physical Memory Manager (bitmap)
+   ================================================== */
+
+#define FRAME_SIZE   4096
+#define BITMAP_ADDR  0x100000          /* 1 Mo : début de la grande zone Usable */
+
+static uint8_t *pmm_bitmap;
+static uint32_t pmm_total_frames;
+
+static inline uint32_t addr_to_frame(uint64_t addr)
+{
+    return addr / FRAME_SIZE;
+}
+
+static void pmm_set(uint32_t frame)
+{
+    pmm_bitmap[frame / 8] |= (1 << (frame % 8));
+}
+
+static void pmm_clear(uint32_t frame)
+{
+    pmm_bitmap[frame / 8] &= ~(1 << (frame % 8));
+}
+
+static int pmm_test(uint32_t frame)
+{
+    return (pmm_bitmap[frame / 8] >> (frame % 8)) & 1;
+}
+
+static void pmm_mark_region_used(uint64_t base, uint64_t length)
+{
+    uint32_t start = addr_to_frame(base);
+    uint32_t end   = addr_to_frame(base + length - 1);
+
+    for (uint32_t f = start; f <= end && f < pmm_total_frames; f++)
+        pmm_set(f);
+}
+
+static void pmm_mark_region_free(uint64_t base, uint64_t length)
+{
+    uint32_t start = addr_to_frame(base);
+    uint32_t end   = addr_to_frame(base + length - 1);
+
+    for (uint32_t f = start; f <= end && f < pmm_total_frames; f++)
+        pmm_clear(f);
+}
+
+static uint32_t pmm_alloc_frame(void)
+{
+    for (uint32_t f = 0; f < pmm_total_frames; f++) {
+        if (!pmm_test(f)) {
+            pmm_set(f);
+            return f;
+        }
+    }
+    return 0xFFFFFFFF;      /* plus aucune frame libre */
+}
+
+static void pmm_free_frame(uint32_t frame)
+{
+    pmm_clear(frame);
+}
+
+static void pmm_init(void)
+{
+    uint32_t count = *MMAP_COUNT;
+    struct mmap_entry *entries = (struct mmap_entry *)MMAP_ADDR;
+
+    /* 1. Trouver l'adresse la plus haute vue dans la carte mémoire,
+          pour savoir combien de frames on doit pouvoir représenter */
+    uint64_t highest = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].type != 1)           /* ignorer tout sauf "Usable" */
+            continue;
+        uint64_t end = entries[i].base + entries[i].length;
+        if (end > highest)
+            highest = end;
+    }
+    pmm_total_frames = addr_to_frame(highest);
+
+    /* 2. Placer le bitmap à une adresse fixe, tout marquer "utilisé" au départ */
+    pmm_bitmap = (uint8_t *)BITMAP_ADDR;
+    uint32_t bitmap_size = (pmm_total_frames + 7) / 8;
+
+    for (uint32_t i = 0; i < bitmap_size; i++)
+        pmm_bitmap[i] = 0xFF;               /* 0xFF = les 8 bits à 1 : tout occupé */
+
+    /* 3. Libérer uniquement les zones marquées "Usable" par le BIOS */
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].type == 1)           /* 1 = Usable */
+            pmm_mark_region_free(entries[i].base, entries[i].length);
+    }
+
+    /* 4. Reprotéger tout ce qui est déjà utilisé par notre propre code :
+          bootloader + stage2 + tables de pagination + kernel + pile + bitmap lui-même */
+    pmm_mark_region_used(0x0,     0x10000);              /* 0 -> 64 Ko : boot, GDT/IDT, PML4/PDPT/PD */
+    pmm_mark_region_used(0x10000, 0x90000 - 0x10000);    /* kernel jusqu'à la base de la pile */
+    pmm_mark_region_used(0x90000 - 0x8000, 0x8000);      /* pile (0x88000 -> 0x90000 environ) */
+    pmm_mark_region_used(BITMAP_ADDR, bitmap_size);       /* le bitmap ne doit jamais s'allouer lui-même */
+}
+
+/* ==================================================
+   Heap kernel (kmalloc / kfree)
+   ================================================== */
+
+#define HEAP_START 0x200000     /* 2 Mo : loin du kernel, du PMM et du bitmap */
+
+struct block_header {
+    uint64_t size;               /* taille utile (sans l'en-tête) */
+    int      free;
+    struct block_header *next;
+};
+
+static struct block_header *heap_head = 0;
+static uint64_t heap_end = HEAP_START;   /* première adresse encore non mappée par le heap */
+
+/* Étend le heap d'au moins `needed` octets, en demandant des frames au PMM */
+static int heap_extend(uint64_t needed)
+{
+    uint64_t frames_needed = (needed + FRAME_SIZE - 1) / FRAME_SIZE;
+
+    for (uint64_t i = 0; i < frames_needed; i++) {
+        uint32_t frame = pmm_alloc_frame();
+        if (frame == 0xFFFFFFFF)
+            return 0;                      /* plus de mémoire physique */
+
+        /* Mapping 1:1 déjà en place jusqu'à 1 Go (nos pages de 2 Mo) donc
+           l'adresse physique de la frame EST directement utilisable ici. */
+        (void)frame;
+        heap_end += FRAME_SIZE;
+    }
+    return 1;
+}
+
+static void *kmalloc(uint64_t size)
+{
+    if (size == 0)
+        return 0;
+
+    size = (size + 7) & ~7ULL;            /* aligner sur 8 octets */
+
+    /* 1. Chercher un bloc libre déjà existant, assez grand */
+    struct block_header *b = heap_head;
+    while (b) {
+        if (b->free && b->size >= size) {
+            b->free = 0;
+            return (void *)(b + 1);        /* les données commencent juste après l'en-tête */
+        }
+        b = b->next;
+    }
+
+    /* 2. Sinon, créer un nouveau bloc à la fin du heap */
+    uint64_t needed = sizeof(struct block_header) + size;
+
+    if (heap_head == 0) {
+        /* tout premier bloc : s'assurer que HEAP_START est mappé */
+        if (heap_end < HEAP_START + needed) {
+            if (!heap_extend(needed))
+                return 0;
+        }
+        struct block_header *nb = (struct block_header *)HEAP_START;
+        nb->size = size;
+        nb->free = 0;
+        nb->next = 0;
+        heap_head = nb;
+        return (void *)(nb + 1);
+    }
+
+    /* trouver la fin de la liste */
+    b = heap_head;
+    while (b->next)
+        b = b->next;
+
+    uint64_t new_block_addr = (uint64_t)(b + 1) + b->size;
+
+    if (new_block_addr + needed > heap_end) {
+        if (!heap_extend(new_block_addr + needed - heap_end))
+            return 0;
+    }
+
+    struct block_header *nb = (struct block_header *)new_block_addr;
+    nb->size = size;
+    nb->free = 0;
+    nb->next = 0;
+    b->next = nb;
+
+    return (void *)(nb + 1);
+}
+
+static void kfree(void *ptr)
+{
+    if (!ptr)
+        return;
+
+    struct block_header *b = (struct block_header *)ptr - 1;
+    b->free = 1;
+}
+
+/* ==================================================
    Handlers interruptions
    ================================================== */
 
@@ -425,6 +672,42 @@ void kmain(void)
     cursor_row = 3;
 
     puts("Kernel C OK!\n");
+
+    mmap_print();
+    pmm_init();
+
+    uint32_t free_count = 0;
+    for (uint32_t f = 0; f < pmm_total_frames; f++)
+        if (!pmm_test(f))
+            free_count++;
+
+    kprintf("PMM : %d frames total, %d libres (%d Ko)\n",
+            (int64_t)pmm_total_frames,
+            (int64_t)free_count,
+            (int64_t)(free_count * 4));
+
+    uint32_t f1 = pmm_alloc_frame();
+    uint32_t f2 = pmm_alloc_frame();
+    kprintf("Alloc test : frame %d, frame %d\n", (int64_t)f1, (int64_t)f2);
+    pmm_free_frame(f1);
+    kprintf("Frame %d liberee\n", (int64_t)f1);
+
+    kprintf("--- Test heap ---\n");
+
+    char *s1 = (char *)kmalloc(32);
+    kprintf("s1 = %x\n", (uint64_t)s1);
+    s1[0] = 'H'; s1[1] = 'i'; s1[2] = 0;
+    kprintf("s1 contient : %s\n", s1);
+
+    int *arr = (int *)kmalloc(10 * sizeof(int));
+    kprintf("arr = %x\n", (uint64_t)arr);
+    for (int i = 0; i < 10; i++)
+        arr[i] = i * i;
+    kprintf("arr[7] = %d\n", (int64_t)arr[7]);
+
+    kfree(s1);
+    char *s2 = (char *)kmalloc(16);   /* devrait réutiliser le bloc de s1 (32 >= 16) */
+    kprintf("s2 = %x (devrait etre proche/egal a s1)\n", (uint64_t)s2);
 
     idt_init();
     kprintf("IDT chargee (%d entrees)\n", (int64_t)32);
