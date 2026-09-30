@@ -13,6 +13,10 @@ start:
     mov sp, 0x7C00
     sti
 
+    ; Effacer l'écran : réinitialise le mode vidéo texte 80x25
+    mov ax, 0x0003
+    int 0x10
+
     mov [boot_drive], dl
 
     ; Lire STAGE2_SECTORS secteurs (à partir du secteur 2) vers 0x0000:0x8000
