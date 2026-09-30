@@ -11,6 +11,7 @@ SECTIONS
     .bss : {
         __bss_start = .;
         *(COMMON)
+        *(.bss)
         *(.bss*)
         __bss_end = .;
     }
