@@ -13,13 +13,14 @@ mkdir -p build/obj
 CFLAGS="-m64 -ffreestanding -fno-pic -fno-stack-protector -mno-red-zone -mgeneral-regs-only -O2 -Ikernel/include"
 
 OBJS=""
-for f in kernel/*.c; do
+for f in kernel/src/*.c; do
     obj="build/obj/$(basename "${f%.c}").o"
     x86_64-elf-gcc $CFLAGS -c "$f" -o "$obj"
     OBJS="$OBJS $obj"
 done
 
-x86_64-elf-ld -m elf_x86_64 -T kernel/linker.ld -nostdlib -o build/kernel.elf $OBJS
+x86_64-elf-gcc $CFLAGS -c kernel/kernel.c -o build/kernel.o
+x86_64-elf-ld -m elf_x86_64 -T kernel/linker.ld -nostdlib -o build/kernel.elf build/kernel.o $OBJS
 x86_64-elf-objcopy -O binary build/kernel.elf build/kernel.bin
 
 dd if=/dev/zero        of=build/fuxos.img bs=512 count=2880
@@ -33,4 +34,5 @@ qemu-system-x86_64 \
     -drive format=raw,file=build/fuxos.img,if=floppy \
     -boot a \
     -no-reboot \
-    -no-shutdown
+    -no-shutdown \
+    -serial stdio

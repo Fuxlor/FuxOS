@@ -1,4 +1,5 @@
 #include "vga.h"
+#include "serial.h"
 #include <stdarg.h>
 
 #define VGA_ADDR 0xB8000
@@ -32,6 +33,8 @@ void console_clear(void)
 
 void putc(char c)
 {
+    serial_putc(c);
+
     if (c == '\n') {
         cursor_col = 0;
         cursor_row++;
